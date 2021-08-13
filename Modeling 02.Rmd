@@ -1,0 +1,271 @@
+---
+title: "DATA MODEL PROCESS"
+author: "Yifei"
+date: "2021-07"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 4
+---
+    
+```{r load_package}
+
+library(tidyverse)
+library(Hmisc)
+library(pROC)
+library(corrplot)
+#library(magrittr)
+library(ROSE)
+```
+
+
+### Data 02 loading
+
+```{r data_load}
+load("training_set.RData")
+df_fill <- rbind(df_file_setA, df_file_setB)
+df_fill <- select(df_fill, -Unit1, -Unit2, -HospAdmTime)
+rm(df_file_setA, df_file_setB)
+```
+
+
+### Mark patient type
+
+```{r data_process}
+person_type <- df_fill %>% 
+    select(person, SepsisLabel ) %>% 
+    unique() %>% 
+    group_by(person) %>% 
+    summarise(
+        unique_sl_count = n(),
+        unique_sl_sum = sum(SepsisLabel)
+    ) %>% 
+    mutate(person_type = ifelse(
+         unique_sl_count == 2, "0 + 1", ifelse(unique_sl_sum == 0, "0", "1")))
+
+person_type %>% 
+    group_by(person_type, unique_sl_count, unique_sl_sum) %>%
+    summarise(person_count = n())
+
+# Label the patients
+df_fill <- df_fill %>%
+    left_join(person_type %>% select(person, person_type), by = "person")
+df_fill$SepsisLabel <- factor(df_fill$SepsisLabel)
+
+summary(df_fill)
+```
+
+
+#### fill again
+
+```{r model_data_fill}
+cols <- colnames(df_fill)
+# Fill in the group mean of'SepsisLabel = 0'
+df_0 <- df_fill %>% filter(SepsisLabel == 0)
+for (col in cols) {
+    if (!(col %in% c("Age", "Gender", "ICULOS", "SepsisLabel", "person", "set", "person_type"))) {
+        df_0[, col] <- as.numeric(impute(df_0[, col], mean))
+    }
+}
+
+# Fill in the group mean of'SepsisLabel = 1'
+df_1 <- df_fill %>% filter(SepsisLabel == 1)
+for (col in cols) {
+    if (!(col %in% c("Age", "Gender", "ICULOS", "SepsisLabel", "person", "set", "person_type"))) {
+        df_1[, col] <- as.numeric(impute(df_1[, col], mean))
+    }
+}
+
+model_data <- rbind(df_0, df_1)
+rm(df_0, df_1)
+```
+
+
+#### Data overview
+
+```{r data_summary}
+model_data %>% group_by(SepsisLabel) %>%
+    summarise(n = n()) %>% arrange(SepsisLabel) %>%
+    mutate(percent = n / sum(n))
+
+summary(model_data)
+```
+
+### Feature Screening
+
+```{r delete_01}
+model_data <- model_data %>% 
+    select(-FiO2, -Lactate,
+-EtCO2, -Bilirubin_direct, -TroponinI, -Fibrinogen,
+
+-Calcium, -Chloride,-Magnesium, -Phosphate, -Potassium, 
+
+-Hgb, -MAP,
+
+-ICULOS, -person, -set)
+```
+
+
+#### PCA
+
+```{r PCA}
+
+nf=ncol(model_data)
+
+data <- model_data %>% select(-SepsisLabel, -person_type)
+
+results <- prcomp(data, scale = TRUE)
+
+summary(results)
+
+# Select the first 16 components
+selected_components <- data.frame(results$x[,1:16])
+combined_components <- cbind(selected_components,model_data[,nf-1],model_data[,nf])
+
+colnames(combined_components) <- c('F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12','F13','F14','F15','F16','SepsisLabel','person_type')
+
+
+
+```
+
+
+### Modeling of '0+1' type patients
+
+#### Percentage split 7:3
+
+```{r model_01_sample}
+set.seed(1)
+model_01_data <- combined_components %>%
+    filter(person_type == "0 + 1") %>%
+    select(-person_type)
+index <- sample(nrow(model_01_data), floor(nrow(model_01_data) * 0.7), replace = F)
+model_01_train <- model_01_data[index, ]
+model_01_test <- model_01_data[-index, ]
+
+# View the training set, test set sample distribution
+rbind(
+    model_01_train %>% group_by(SepsisLabel) %>% summarise(n = n()) %>% mutate(type = "train"), 
+    model_01_test %>% group_by(SepsisLabel) %>% summarise(n = n()) %>% mutate(type = "test")
+) %>% spread(SepsisLabel, n) %>% 
+    mutate(`1-per` = round(`1` / (`0` + `1`), 4))
+```
+
+
+#### Sampling
+
+```{r bothsampling}
+# Combine undersampling and oversampling
+train_df_balanced_both <- ovun.sample(SepsisLabel ~ ., data = model_01_train, method = "both", seed = 1, p = 0.5)$data
+table(train_df_balanced_both$SepsisLabel)
+
+```
+
+
+
+
+#### Logistic regression
+
+```{r models}
+library(gmodels)
+
+model_01_logistic <- glm(SepsisLabel ~., data = train_df_balanced_both, family = binomial(link = "logit"))
+
+pred_01_logistic <- predict(model_01_logistic, model_01_test, type = "response")
+pred_01_logistic_class <- ifelse(pred_01_logistic >= 0.7, 1, 0)
+table(pred_01_logistic_class, model_01_test$SepsisLabel)
+
+# ROC
+roc_logistic <- roc(
+    as.numeric(model_01_test$SepsisLabel), 
+    as.numeric(pred_01_logistic))
+
+roc_logistic
+plot(roc_logistic, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+
+
+```
+
+#### Decision tree
+```{r models}
+library(C50)
+model_01_C50 <- C5.0(train_df_balanced_both %>% select(-SepsisLabel), train_df_balanced_both$SepsisLabel, trials = 100)
+
+pred_01_C50 <- predict(model_01_C50, model_01_test %>% select(-SepsisLabel), type = "prob") 
+table(pred_01_C50[,2]>0.5, model_01_test$SepsisLabel)
+
+# ROC
+roc_C50 <- roc(
+    as.numeric(model_01_test$SepsisLabel), 
+    as.numeric(pred_01_C50[,2]))
+roc_C50
+plot(roc_C50, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+
+```
+
+#### Naive Bayes
+```{r models}
+library(e1071)
+model_01_naiveBayes <- naiveBayes(train_df_balanced_both %>% select(-SepsisLabel), train_df_balanced_both$SepsisLabel, laplace = 1)
+
+pred_01_naiveBayes <- predict(model_01_naiveBayes, model_01_test %>% select(-SepsisLabel), type = "raw")
+
+table(pred_01_naiveBayes[,2]>0.5, model_01_test$SepsisLabel)
+
+# roc
+roc_naiveBayes <- roc(
+    as.numeric(model_01_test$SepsisLabel), 
+    as.numeric(pred_01_naiveBayes[,2]))
+
+roc_naiveBayes
+plot(roc_naiveBayes, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+
+```
+
+
+#### Random forest
+```{r models}
+library(randomForest)
+model_01_randomForest <- randomForest(SepsisLabel ~ ., data = train_df_balanced_both, ntree = 200,importance=TRUE)
+
+pred_01_randomForest <- predict(model_01_randomForest, model_01_test, type = "prob")
+
+table(pred_01_randomForest[,2]>0.5, model_01_test$SepsisLabel)
+
+
+# ROC
+roc_randomForest <- roc(
+    as.numeric(model_01_test$SepsisLabel), 
+    as.numeric(pred_01_randomForest[,2]))
+roc_randomForest
+plot(roc_randomForest, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+
+```
+
+#### SVM
+
+```{r model_svm}
+library(e1071)
+#model_svm <- svm(SepsisLabel ~ ., data = train_df_balanced_both)
+
+load("model_svm.RData")
+load("test01.RData")
+pred_svm <- predict(model_svm, model_01_test, type = "class")
+
+table(pred_svm, model_01_test$SepsisLabel)
+
+# ROC
+roc_svm <- roc(
+    as.numeric(model_01_test$SepsisLabel), 
+    as.numeric(pred_svm))
+roc_svm
+plot(roc_svm, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+
+```
+
+
+
+
+
+
+
+

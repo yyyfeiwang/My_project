@@ -1,0 +1,349 @@
+---
+title: "DATA MODEL PROCESS"
+author: "Yifei"
+date: "2021-07"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 4
+---
+    
+```{r load_package}
+
+library(tidyverse)
+library(Hmisc)
+library(pROC) #Plot the ROC curve
+library(corrplot) #Correlation coefficient matrix
+#library(magrittr)
+library(ROSE) #Sampling
+```
+
+
+### Data 02 loading
+
+```{r data_load}
+load("training_set.RData")
+df_fill <- rbind(df_file_setA, df_file_setB)
+df_fill <- select(df_fill, -Unit1, -Unit2, -HospAdmTime)
+rm(df_file_setA, df_file_setB)
+```
+
+
+### Mark patient type
+
+```{r data_process}
+person_type <- df_fill %>% 
+    select(person, SepsisLabel ) %>% 
+    unique() %>% 
+    group_by(person) %>% 
+    summarise(
+        unique_sl_count = n(),
+        unique_sl_sum = sum(SepsisLabel)
+    ) %>% 
+    mutate(person_type = ifelse(
+         unique_sl_count == 2, "0 + 1", ifelse(unique_sl_sum == 0, "0", "1")))
+
+person_type %>% 
+    group_by(person_type, unique_sl_count, unique_sl_sum) %>%
+    summarise(person_count = n())
+
+# Label the patients
+df_fill <- df_fill %>%
+    left_join(person_type %>% select(person, person_type), by = "person")
+df_fill$SepsisLabel <- factor(df_fill$SepsisLabel)
+
+summary(df_fill)
+```
+
+#### Fill again
+
+```{r model_data_fill}
+cols <- colnames(df_fill)
+# Fill in the group mean of'SepsisLabel = 0'
+df_0 <- df_fill %>% filter(SepsisLabel == 0)
+for (col in cols) {
+    if (!(col %in% c("Age", "Gender", "ICULOS", "SepsisLabel", "person", "set", "person_type"))) {
+        df_0[, col] <- as.numeric(impute(df_0[, col], mean))
+    }
+}
+
+# Fill in the group mean of'SepsisLabel = 1'
+df_1 <- df_fill %>% filter(SepsisLabel == 1)
+for (col in cols) {
+    if (!(col %in% c("Age", "Gender", "ICULOS", "SepsisLabel", "person", "set", "person_type"))) {
+        df_1[, col] <- as.numeric(impute(df_1[, col], mean))
+    }
+}
+
+model_data <- rbind(df_0, df_1)
+rm(df_0, df_1)
+```
+
+
+#### Data overview
+
+```{r data_summary}
+model_data %>% group_by(SepsisLabel) %>%
+    summarise(n = n()) %>% arrange(SepsisLabel) %>%
+    mutate(percent = n / sum(n))
+
+summary(model_data)
+```
+
+### Feature engineering 
+
+
+#### Eliminate based on expert knowledge
+
+```{r delete_01}
+model_data <- model_data %>% 
+    select(-FiO2, -Lactate,
+-EtCO2, -Bilirubin_direct, -TroponinI, -Fibrinogen,
+
+-Calcium, -Chloride,-Magnesium, -Phosphate, -Potassium, 
+
+-ICULOS, -person_type, -person, -set)
+```
+
+
+#### Correlation coefficient analysis
+
+```{r delete_02}
+M <- cor(model_data %>% select(-SepsisLabel))
+corrplot(M, order = "AOE", addCoef.col = "grey", cl.cex = 0.3, number.cex = 0.4)
+
+# Delete highly correlated variables
+model_data <- model_data %>% select(-Hgb, -MAP)
+```
+
+
+#### Principal component analysis
+
+```{r PCA}
+library(DataExplorer) # graphical techniques  tools
+
+nf=ncol(model_data)
+
+data <- model_data %>% select(-SepsisLabel)
+
+results <- prcomp(data, scale = TRUE)
+
+summary(results)
+
+# Select the first 16 components
+selected_components <- data.frame(results$x[,1:16])
+combined_components <- cbind(selected_components,model_data[,nf])
+
+colnames(combined_components) <- c('F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12','F13','F14','F15','F16','SepsisLabel')
+
+
+# plot
+plot_prcomp(data,ncol=4L,nrow=1L,variance_cap=0.86)
+
+
+
+```
+
+
+### Modeling
+
+#### Split data set 6:2:2
+
+```{r model_all_sample}
+model_all <- combined_components
+set.seed(1)
+
+model_cut <- c(train = 0.6, validate = 0.2, test = 0.2)
+sample_index <- sample(cut(
+    seq(nrow(model_all)), 
+    nrow(model_all) * cumsum(c(0, model_cut)),
+    labels = names(model_cut)
+))
+
+model_all_set <- split(model_all, sample_index)
+
+model_all_train <- model_all_set$train
+model_all_validate <- model_all_set$validate
+model_all_test <- model_all_set$test
+rm(model_all, model_cut, sample_index, model_all_set)
+
+# View the sample distribution of training set, validation set, and test set
+rbind(
+    model_all_train %>% group_by(SepsisLabel) %>% summarise(n = n()) %>% mutate(type = "train"),
+    model_all_validate %>% group_by(SepsisLabel) %>% summarise(n = n()) %>% mutate(type = "validate"),
+    model_all_test %>% group_by(SepsisLabel) %>% summarise(n = n()) %>% mutate(type = "test")
+) %>% spread(SepsisLabel, n) %>%
+    mutate(`1-per` = round(`1` / (`0` + `1`), 4))
+
+```
+
+#### Sampling
+
+```{r bothsampling}
+# Combine undersampling and oversampling
+train_df_balanced_both <- ovun.sample(SepsisLabel ~ ., data = model_all_train, method = "both", seed = 1, p = 0.5)$data
+table(train_df_balanced_both$SepsisLabel)
+
+```
+
+
+#### Logistic regression
+
+```{r model_logistic}
+library(gmodels)
+
+model_logistic <- glm(SepsisLabel ~., data = train_df_balanced_both, family = binomial(link = "logit"))
+
+summary(model_logistic)
+
+pred_logistic <- predict(model_logistic, model_all_validate, type = "response")
+pred_logistic_class <- ifelse(pred_logistic >= 0.7, 1, 0)
+
+# Confusion matrix
+table(pred_logistic_class, model_all_validate$SepsisLabel)
+
+# ROC
+roc_logistic <- roc(
+    as.numeric(model_all_validate$SepsisLabel), 
+    as.numeric(pred_logistic))
+
+roc_logistic
+plot(roc_logistic, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+```
+
+
+#### Decision tree
+
+```{r model_C50}
+library(C50)
+#error_cost <- matrix(c(0, 4, 1, 0), nrow = 2)
+load("training.RData")
+load("test.RData")
+
+model_C50 <- C5.0(train_df_balanced_both %>% select(-SepsisLabel), train_df_balanced_both$SepsisLabel, trials = 100)
+
+##summary(model_C50)
+
+
+pred_C50 <- predict(model_C50, model_all_validate %>% select(-SepsisLabel), type = "prob")
+
+# Confusion matrix
+table(pred_C50[,2]>0.5, model_all_validate$SepsisLabel)
+
+# ROC
+roc_C50 <- roc(
+    as.numeric(model_all_validate$SepsisLabel), 
+    as.numeric(pred_C50[,2]))
+roc_C50
+plot(roc_C50, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+```
+
+
+
+#### Naive Bayes
+
+```{r model_naiveBayes}
+library(e1071)
+model_naiveBayes <- naiveBayes(
+    train_df_balanced_both %>% select(-SepsisLabel), train_df_balanced_both$SepsisLabel,laplace=1)
+
+summary(model_naiveBayes)
+
+pred_naiveBayes <- predict(model_naiveBayes, model_all_validate %>% select(-SepsisLabel), type = "raw")
+
+# Confusion matrix
+table(pred_naiveBayes[,2]>0.5, model_all_validate$SepsisLabel)
+
+# ROC
+roc_naiveBayes <- roc(
+    as.numeric(model_all_validate$SepsisLabel), 
+    as.numeric(pred_naiveBayes[,2]))
+
+roc_naiveBayes
+plot(roc_naiveBayes, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+```
+
+
+
+#### Random forest
+
+```{r model_randomForest}
+library(randomForest)
+model_randomForest <- randomForest(SepsisLabel ~ ., data = train_df_balanced_both, ntree = 200)
+
+#summary(model_randomForest)
+plot(model_randomForest)
+
+pred_randomForest <- predict(model_randomForest, model_all_validate, type = "prob")
+
+# Confusion matrix
+table(pred_randomForest[,2]>0.5, model_all_validate$SepsisLabel)
+
+# roc
+roc_randomForest <- roc(
+    as.numeric(model_all_validate$SepsisLabel), 
+    as.numeric(pred_randomForest[,2]))
+roc_randomForest
+plot(roc_randomForest, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+```
+
+#### Model effect comparison
+
+```{r model_compare}
+cm_logistic     <- confusionMatrix(
+    factor(pred_logistic_class), reference = model_all_validate$SepsisLabel, positive = '1')
+
+cm_C50          <- confusionMatrix(
+    pred_C50           , reference = model_all_validate$SepsisLabel, positive = '1')
+
+cm_naiveBayes   <- confusionMatrix(
+    pred_naiveBayes    , reference = model_all_validate$SepsisLabel, positive = '1')
+
+cm_randomForest <- confusionMatrix(
+    pred_randomForest  , reference = model_all_validate$SepsisLabel, positive = '1')
+
+models_sta <- round(rbind(
+    cbind(t(as.data.frame(cm_logistic$overall)), t(as.data.frame(cm_logistic$byClass))) %>%
+        as.data.frame(),
+    cbind(t(as.data.frame(cm_C50$overall)), t(as.data.frame(cm_C50$byClass))) %>%
+        as.data.frame(),
+    cbind(t(as.data.frame(cm_naiveBayes$overall)), t(as.data.frame(cm_naiveBayes$byClass))) %>%
+        as.data.frame(),
+    cbind(t(as.data.frame(cm_randomForest$overall)), t(as.data.frame(cm_randomForest$byClass))) %>%
+        as.data.frame()
+), 4) %>% 
+    select(Accuracy, Precision, Recall, F1) %>%
+    # t() %>%
+    as.data.frame()
+row.names(models_sta) <- gsub("cm_", "", gsub("\\$overall", "", row.names(models_sta)))
+
+library(formattable)
+models_sta %>% formattable()
+```
+
+
+#### Test set to verify the final effect
+
+```{r model_test}
+
+model_pred <- predict(model_randomForest, model_all_test, type = "prob")
+
+#model_pred <- predict(model_C50, model_all_test, type = "prob")
+
+
+# Confusion matrix
+table(model_pred[,2]>0.5, model_all_test$SepsisLabel)
+
+# ROC
+model_roc <- roc(
+    as.numeric(model_all_test$SepsisLabel), 
+    as.numeric(model_pred[,2]))
+model_roc
+plot(model_roc, print.auc = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, auc.polygon.col = "grey")
+
+```
+
+
+
+
+
