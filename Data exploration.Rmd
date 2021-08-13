@@ -1,0 +1,169 @@
+---
+title: "Data exploration"
+author: "Yifei"
+date: "2021-07"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 4
+---
+    
+```{r Load_package}
+library(tidyverse)
+library(Hmisc)
+library(ggplot2)
+```
+
+### Original data 01 loading
+
+```{r data_load}
+load("training_set_o.RData")
+df_original <- rbind(df_file_set_oA, df_file_set_oB)
+rm(df_file_set_oA, df_file_set_oB)
+```
+
+### Mark patient type
+
+* 0+1 type: SepsisLabel has two values: 0 and 1
+* All 0 type: SepsisLabel has only one value 0
+* All 1 type: SepsisLabel has only one value 1
+
+```{r Patient_type}
+person_type <- df_original %>% 
+    select(person, SepsisLabel ) %>% 
+    unique() %>% 
+    group_by(person) %>% 
+    summarise(
+        unique_sl_count = n(),
+        unique_sl_sum = sum(SepsisLabel)
+    ) %>% 
+    mutate(person_type = ifelse(
+         unique_sl_count == 2, "0 + 1", ifelse(unique_sl_sum == 0, "0", "1")))
+
+person_type %>% 
+    group_by(person_type, unique_sl_count, unique_sl_sum) %>%
+    summarise(person_count = n())
+
+# Label these patients
+df_original <- df_original %>% 
+    left_join(person_type %>% select(person, person_type), by = "person")
+df_original$SepsisLabel <- factor(df_original$SepsisLabel)
+```
+
+### Plot
+
+#### Univariate histogram
+
+```{r data_histogram}
+ggplot(df_original, aes(x = HR, y = ..count.., fill = SepsisLabel)) +
+    geom_histogram(color = "black", binwidth = 4) + 
+    scale_fill_manual(values = c("#ffffff", "#bdbdbd")) +
+    theme(legend.position = "top")
+```
+#### Normalized histogram
+
+```{r Normalized_histogram}
+df1 <- df_original %>% select(O2Sat, SepsisLabel )
+df1$SepsisLabel<-as.character(df1$SepsisLabel)
+df1$O2Sat<-scale(df1$O2Sat)
+
+ggplot(df1,aes(x=O2Sat,y=..density..))+
+  geom_histogram(aes(fill=SepsisLabel),col="black",binwidth = 0.3,alpha=0.4,position = "identity" )+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(),panel.grid.minor = element_line(color = "gray"),legend.position = "top",
+      axis.line.x = element_line())+
+  scale_y_continuous(limits  = c(0,0.5),breaks = seq(0,0.5,0.1),expand = c(0,0))+
+  scale_x_continuous(limits  = c(-4,5),breaks = seq(-5,5,1),expand = c(0,0))+
+  labs(x="O2Sat(Standardized)",y="Density") 
+
+```
+
+
+#### Scatter plot of pairwise variables
+
+```{r data_scatter}
+ggplot(df_original, aes(x = Age, y = Temp, color = SepsisLabel)) +
+    geom_point() +
+    geom_vline(xintercept = 50, color = "#000000") +
+    scale_color_manual(values = c("#c51b7d", "#276419")) +
+    scale_x_continuous(breaks = seq(0, 100, 10)) +
+    theme(legend.position = "top")
+```
+
+
+#### Select a single patient to draw a line chart
+
+```{r data_0_1_line}
+# Select a patient with type '0+1'
+person_01 <- df_original %>% 
+    filter(person_type == "0 + 1")
+
+person_01 <- rbind(
+    person_01 %>% select(person, SepsisLabel, ICULOS, y = HR) %>% mutate(col = "HR"),
+    person_01 %>% select(person, SepsisLabel, ICULOS, y = O2Sat) %>% mutate(col = "O2Sat"),
+    person_01 %>% select(person, SepsisLabel, ICULOS, y = SBP) %>% mutate(col = "SBP"),
+    person_01 %>% select(person, SepsisLabel, ICULOS, y = MAP) %>% mutate(col = "MAP"),
+    person_01 %>% select(person, SepsisLabel, ICULOS, y = DBP) %>% mutate(col = "DBP"),
+    person_01 %>% select(person, SepsisLabel, ICULOS, y = Resp) %>% mutate(col = "Resp"),
+    person_01 %>% select(person, SepsisLabel, ICULOS, y = Temp) %>% mutate(col = "Temp")
+)
+
+# Calculate the top 10 patients with the least proportion of missing values
+person_01 %>% 
+    mutate(is_not_na = ifelse(is.na(y), 0, 1)) %>% 
+    group_by(person) %>%
+    summarise(
+        n_ICULOS = n(), n_not_na = sum(is_not_na),
+        not_na_per = sum(is_not_na) / n()
+    ) %>%
+    arrange(desc(n_not_na), desc(n_ICULOS)) %>% head(10)
+
+
+
+# p104049.psv
+person_01 %>%
+    filter(person == "p104049") %>%
+    ggplot(aes(x = ICULOS, y)) +
+    geom_line(aes(color = SepsisLabel)) +
+    facet_wrap(~col, ncol = 1, scales = "free_y") +
+    scale_color_manual(values = c("#c51b7d", "#276419")) +
+    ggtitle("Person - p005359") +
+    scale_x_continuous(breaks = seq(0, 330, 10)) +
+    theme(
+        legend.position = "top", 
+        axis.title.y = element_blank(), 
+        axis.text.x = element_text(angle = 45)
+    )
+```
+
+
+#### box plot
+```{r box_plot}
+df_original %>% select(ICULOS, SepsisLabel) %>% 
+    ggplot(aes(x = SepsisLabel, y = ICULOS, 
+               group = SepsisLabel, color = SepsisLabel)) +
+    geom_boxplot() +theme_minimal() + 
+    theme(legend.position = "top")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
